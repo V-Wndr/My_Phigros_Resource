@@ -1,0 +1,21 @@
+*.apk
+*.obb
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+_work/
+
+# 流水线生成物留在本地，不上传
+chart/
+music/
+illustration/
+illustrationLowRes/
+illustrationBlur/
+avatar/
+splited_music/
+phira/
+*.pez
+site/illustration/
+info/*.tsv
+info/*.txt
