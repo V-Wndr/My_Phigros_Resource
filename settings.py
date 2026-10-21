@@ -46,6 +46,7 @@ def pipeline_paths(parser: ConfigParser | None = None) -> dict:
         "songlist": site_dir / "songlist.json",
         "illustration_dir": site_dir / "illustration",
         "pack_map": ROOT / "pack_map.json",
+        "song_map": ROOT / "song_map.json",
         "info_tsv": ROOT / "info" / "info.tsv",
         "difficulty_tsv": ROOT / "info" / "difficulty.tsv",
         "bpm_tsv": ROOT / "info" / "bpm.tsv",

@@ -18,17 +18,11 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         pass
 
 
-SPECIAL_DIFFICULTY_KEY_MAPPING = {
+# 标题去符号后的别名 → 其它写法（Unicode / 拼写），不是同名曲区分。
+TITLE_KEY_ALIASES = {
     "slips": ["solips", "sølips"],
     "poseidon": ["ποσειδών"],
     "parsey": ["ρarsey"],
-}
-
-SPECIAL_DIFFICULTY_ID_MAPPING = {
-    "anotherme": [
-        ("anotherme.neutralmoon", "risingsun"),
-        ("anotherme.daan", "kalpa"),
-    ],
 }
 
 
@@ -159,6 +153,80 @@ def save_pack_map(data: dict, path: Path | None = None) -> None:
         handle.write("\n")
 
 
+def load_song_map(path: Path | None = None) -> dict[str, str]:
+    """phigrosId → 站点 id（完整 id）。同名曲靠这个区分，不写进 songlist。"""
+    path = path or pipeline_paths()["song_map"]
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        return {}
+    cleaned = {}
+    for phigros_id, site_id in data.items():
+        pid = str(phigros_id or "").strip()
+        sid = str(site_id or "").strip()
+        if pid and sid:
+            cleaned[pid] = sid
+    return cleaned
+
+
+def save_song_map(data: dict[str, str], path: Path | None = None) -> None:
+    path = path or pipeline_paths()["song_map"]
+    cleaned = {}
+    for phigros_id, site_id in (data or {}).items():
+        pid = str(phigros_id or "").strip()
+        sid = str(site_id or "").strip()
+        if pid and sid:
+            cleaned[pid] = sid
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(cleaned, handle, ensure_ascii=False, indent=4)
+        handle.write("\n")
+
+
+def remap_song_map_ids(id_pairs: list[tuple[str, str]]) -> None:
+    """分章改了站点 id 时，同步改 song_map 里的完整 id。"""
+    if not id_pairs:
+        return
+    mapping = load_song_map()
+    if not mapping:
+        return
+    remap = {old: new for old, new in id_pairs if old and new and old != new}
+    if not remap:
+        return
+    changed = False
+    for phigros_id, site_id in list(mapping.items()):
+        if site_id in remap:
+            mapping[phigros_id] = remap[site_id]
+            changed = True
+    if changed:
+        save_song_map(mapping)
+
+
+def find_song_by_site_id(site_id: str, data: list, occupied: set[int] | None = None):
+    """按完整站点 id 精确匹配。"""
+    occupied = occupied or set()
+    site_id = (site_id or "").strip()
+    if not site_id:
+        return None
+    for index, song in enumerate(data):
+        if index in occupied:
+            continue
+        if (song.get("id") or "").strip() == site_id:
+            return index, song
+    return None
+
+
+def ambiguous_title_keys(info_rows: list[dict] | None = None) -> set[str]:
+    info_rows = info_rows if info_rows is not None else load_info_tsv()
+    counts: dict[str, int] = {}
+    for row in info_rows:
+        key = normalize_key(row.get("title") or "")
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
 def load_info_tsv(path: Path | None = None) -> list[dict]:
     path = path or pipeline_paths()["info_tsv"]
     rows = []
@@ -226,18 +294,15 @@ def load_difficulty_by_title(path: Path | None = None) -> dict[str, dict]:
     result = {}
     if not path.exists():
         return result
+    ambiguous = ambiguous_title_keys()
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
             parts = line.rstrip("\n\r").split("\t")
             if len(parts) < 4:
                 continue
             full_col = parts[0]
-            split_full = full_col.split(".", 1)
-            title_part = split_full[0]
-            charter_part = split_full[1] if len(split_full) > 1 else ""
-            base_key = normalize_key(title_part)
-            full_key = f"{base_key}.{normalize_key(charter_part)}" if charter_part else base_key
-            key = full_key if base_key in SPECIAL_DIFFICULTY_ID_MAPPING and charter_part else base_key
+            title_part = full_col.split(".", 1)[0]
+            key = normalize_key(title_part)
             try:
                 ez, hd, inn = float(parts[1]), float(parts[2]), float(parts[3])
             except ValueError:
@@ -249,9 +314,12 @@ def load_difficulty_by_title(path: Path | None = None) -> dict[str, dict]:
                 except ValueError:
                     at = ""
             diff = {"ez": ez, "hd": hd, "in": inn, "at": at}
+            # 同名曲不要用标题索引；定数走 phigrosId / song_map。
+            if key in ambiguous:
+                continue
             if key not in result or (diff["at"] != "" and result.get(key, {}).get("at", "") == ""):
                 result[key] = diff
-            for alias in SPECIAL_DIFFICULTY_KEY_MAPPING.get(key, []):
+            for alias in TITLE_KEY_ALIASES.get(key, []):
                 if alias not in result or (diff["at"] != "" and result.get(alias, {}).get("at", "") == ""):
                     result[alias] = diff
     return result
@@ -290,56 +358,113 @@ def load_bpm_tsv(path: Path | None = None) -> dict[str, tuple]:
     return result
 
 
-def find_song_by_title(title: str, data: list, occupied: set[int] | None = None):
+def iter_title_matches(title: str, data: list, occupied: set[int] | None = None):
+    """按标题 / 别称列出未占用匹配，不自动挑第一首。"""
     occupied = occupied or set()
     norm = normalize_title(title)
     key = normalize_key(title)
+    seen = set()
     if norm:
         for index, song in enumerate(data):
-            if index in occupied:
+            if index in occupied or index in seen:
                 continue
             if normalize_title(song.get("标题") or "") == norm:
-                return index, song
+                seen.add(index)
+                yield index, song
+                continue
             for alias in song.get("别称") or []:
                 if normalize_title(alias or "") == norm:
-                    return index, song
+                    seen.add(index)
+                    yield index, song
+                    break
     if key:
         for index, song in enumerate(data):
-            if index in occupied:
+            if index in occupied or index in seen:
                 continue
             if normalize_key(song.get("标题") or "") == key:
-                return index, song
+                seen.add(index)
+                yield index, song
+                continue
             for alias in song.get("别称") or []:
                 if normalize_key(alias or "") == key:
-                    return index, song
+                    seen.add(index)
+                    yield index, song
+                    break
         if len(key) >= 4:
             for index, song in enumerate(data):
-                if index in occupied:
+                if index in occupied or index in seen:
                     continue
                 song_key = normalize_key(song.get("标题") or "")
                 if song_key and (song_key.startswith(key) or key.startswith(song_key)):
-                    return index, song
+                    seen.add(index)
+                    yield index, song
+
+
+def find_song_by_title(title: str, data: list, occupied: set[int] | None = None):
+    matches = list(iter_title_matches(title, data, occupied))
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
-def find_difficulty_for_song(song: dict, by_id: dict, by_title: dict) -> dict | None:
-    apk_id = apk_id_for_song(song)
+def find_song_for_info_row(
+    row: dict,
+    data: list,
+    occupied: set[int] | None = None,
+    song_map: dict[str, str] | None = None,
+    bpm_map: dict | None = None,
+):
+    """
+    对齐顺序：
+    1. song_map 里的完整站点 id
+    2. 标题唯一命中
+    3. 同名多首时，若 BPM 能唯一区分则用 BPM
+    同名且无法区分时返回 None，由调用方决定是跳过还是进待分类。
+    """
+    occupied = occupied or set()
+    song_map = song_map if song_map is not None else load_song_map()
+    phigros_id = row.get("phigrosId") or ""
+    title = normalize_title(row.get("title") or "") or phigros_id
+    site_id = song_map.get(phigros_id)
+    if site_id:
+        found = find_song_by_site_id(site_id, data, occupied)
+        if found is not None:
+            return found, "song_map"
+        # 映射有 id 但 songlist 里还没有（例如仍是 Pending）：继续用标题 / BPM
+
+    matches = list(iter_title_matches(title, data, occupied))
+    if len(matches) == 1:
+        return matches[0], "title"
+    if len(matches) > 1 and bpm_map and phigros_id in bpm_map:
+        main_bpm = bpm_map[phigros_id][0]
+        bpm_hits = [
+            item for item in matches
+            if same_bpm((item[1].get("bpm")), main_bpm)
+        ]
+        if len(bpm_hits) == 1:
+            return bpm_hits[0], "bpm"
+        return None, "ambiguous"
+    if len(matches) > 1:
+        return None, "ambiguous"
+    return None, "new"
+
+
+def find_difficulty_for_song(
+    song: dict,
+    by_id: dict,
+    by_title: dict,
+    info_rows: list[dict] | None = None,
+    song_map: dict[str, str] | None = None,
+) -> dict | None:
+    apk_id = apk_id_for_song(song, info_rows, song_map)
     if apk_id and apk_id in by_id:
         return by_id[apk_id]
-    song_id = song.get("id") or ""
     key = normalize_key(song.get("标题") or "")
-    if key in SPECIAL_DIFFICULTY_ID_MAPPING:
-        song_id_norm = song_id.lower().replace("_", "").replace("-", "")
-        for full_key, id_substr in SPECIAL_DIFFICULTY_ID_MAPPING[key]:
-            if id_substr.lower().replace("_", "").replace("-", "") in song_id_norm:
-                if full_key in by_title:
-                    return by_title[full_key]
-                break
-    if key in by_title:
+    if key and key not in ambiguous_title_keys(info_rows) and key in by_title:
         return by_title[key]
     for alias in song.get("别称") or []:
         alias_key = normalize_key(alias or "")
-        if alias_key in by_title:
+        if alias_key and alias_key in by_title:
             return by_title[alias_key]
     return None
 
@@ -386,24 +511,22 @@ def format_difficulty(diff: dict | None) -> str:
     return " / ".join(parts)
 
 
-def apk_id_for_song(song: dict, info_rows: list[dict] | None = None) -> str:
-    """用标题 / 别称 / 站点 id 对照 info.tsv，不写回 songlist。"""
+def apk_id_for_song(
+    song: dict,
+    info_rows: list[dict] | None = None,
+    song_map: dict[str, str] | None = None,
+) -> str:
+    """用 song_map / 标题 / 别称对照 info.tsv，不写回 songlist。"""
     info_rows = info_rows if info_rows is not None else load_info_tsv()
-    title_key = normalize_key(song.get("标题") or "")
-    song_id = song.get("id") or ""
+    song_map = song_map if song_map is not None else load_song_map()
+    song_id = (song.get("id") or "").strip()
+
+    if song_id:
+        for phigros_id, site_id in song_map.items():
+            if site_id == song_id:
+                return phigros_id
+
     names = [song.get("标题") or ""] + list(song.get("别称") or [])
-
-    if title_key in SPECIAL_DIFFICULTY_ID_MAPPING:
-        song_id_norm = song_id.lower().replace("_", "").replace("-", "")
-        for _full_key, id_substr in SPECIAL_DIFFICULTY_ID_MAPPING[title_key]:
-            needle = id_substr.lower().replace("_", "").replace("-", "")
-            if needle not in song_id_norm:
-                continue
-            for row in info_rows:
-                hay = (row.get("phigrosId") or "").lower().replace("_", "").replace("-", "").replace(".", "")
-                if needle in hay and normalize_key(row.get("title") or "") == title_key:
-                    return row["phigrosId"]
-
     matches = []
     for name in names:
         norm = normalize_title(name)
@@ -418,13 +541,25 @@ def apk_id_for_song(song: dict, info_rows: list[dict] | None = None) -> str:
     if len(matches) == 1:
         return matches[0]["phigrosId"]
     if len(matches) > 1:
-        return matches[0]["phigrosId"]
+        bpm_map = load_bpm_tsv()
+        song_bpm = song.get("bpm")
+        bpm_hits = [
+            row for row in matches
+            if row.get("phigrosId") in bpm_map and same_bpm(song_bpm, bpm_map[row["phigrosId"]][0])
+        ]
+        if len(bpm_hits) == 1:
+            return bpm_hits[0]["phigrosId"]
+        return ""
     return ""
 
 
-def info_for_song(song: dict, info_rows: list[dict] | None = None) -> dict:
+def info_for_song(
+    song: dict,
+    info_rows: list[dict] | None = None,
+    song_map: dict[str, str] | None = None,
+) -> dict:
     info_rows = info_rows if info_rows is not None else load_info_tsv()
-    apk_id = apk_id_for_song(song, info_rows)
+    apk_id = apk_id_for_song(song, info_rows, song_map)
     if not apk_id:
         return {}
     for row in info_rows:
@@ -559,6 +694,7 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
     else:
         log("读取 songlist：%d 首，已识别曲包 %d 个" % (len(data), len(packs_found)))
     info_rows = load_info_tsv(paths["info_tsv"])
+    song_map = load_song_map()
     diff_by_id = load_difficulty_by_id(paths["difficulty_tsv"])
     diff_by_title = load_difficulty_by_title(paths["difficulty_tsv"])
     bpm_map = load_bpm_tsv(paths["bpm_tsv"])
@@ -567,20 +703,28 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
     new_entries = []
     changed_ids = []
     unmatched_info = []
+    skipped_ambiguous = []
     diff_logs = []
     bpm_logs = []
 
     for row in info_rows:
         pid = row["phigrosId"]
         title = normalize_title(row["title"]) or pid
-        found = find_song_by_title(title, data, occupied)
+        found, how = find_song_for_info_row(
+            row, data, occupied, song_map=song_map, bpm_map=bpm_map,
+        )
         if found is None:
+            if how == "ambiguous":
+                skipped_ambiguous.append((row, how))
+                continue
             unmatched_info.append(row)
             continue
         index, song = found
         occupied.add(index)
         sid = song.get("id") or ""
-        diff = find_difficulty_for_song(song, diff_by_id, diff_by_title)
+        diff = diff_by_id.get(pid) or find_difficulty_for_song(
+            song, diff_by_id, diff_by_title, info_rows, song_map,
+        )
         if diff:
             before = dict(song.get("难度") or {})
             if apply_difficulty(song, diff):
@@ -602,7 +746,8 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
     for row, new_id in zip(unmatched_info, pending_ids):
         title = normalize_title(row["title"]) or row["phigrosId"]
         entry = new_song_entry(title, packs["pending_name"], new_id)
-        diff = find_difficulty_for_song(entry, diff_by_id, diff_by_title)
+        # 新曲定数 / BPM 直接按本行 phigrosId 写，避免同名曲在 Pending id 下对错。
+        diff = diff_by_id.get(row["phigrosId"])
         if diff:
             apply_difficulty(entry, diff)
         if row["phigrosId"] in bpm_map:
@@ -635,6 +780,10 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
         log("新增待分类 %d 首：" % len(new_entries))
         for entry in new_entries:
             log("  %s  %s" % (entry.get("id"), entry.get("标题")))
+    if skipped_ambiguous:
+        log("跳过同名歧义 %d 首（在 song_map.json 写 phigrosId → 完整站点 id，或确保 BPM 能区分）：" % len(skipped_ambiguous))
+        for row, _how in skipped_ambiguous:
+            log("  %s  %s" % (row.get("phigrosId"), row.get("title")))
     if diff_logs:
         log("更新定数 %d 首：" % len(diff_logs))
         for line in diff_logs:
@@ -644,8 +793,8 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
         for line in bpm_logs:
             log(line)
     log(
-        "songlist：新增 %d，变更定数/BPM %d，待分类 %d"
-        % (len(new_entries), len(diff_logs) + len(bpm_logs), pending_count)
+        "songlist：新增 %d，变更定数/BPM %d，待分类 %d，同名跳过 %d"
+        % (len(new_entries), len(diff_logs) + len(bpm_logs), pending_count, len(skipped_ambiguous))
     )
     return {
         "new": new_entries,
@@ -653,6 +802,7 @@ def update_from_info(logger=None, update_bpm: bool = False) -> dict:
         "pending_count": pending_count,
         "diff_logs": diff_logs,
         "bpm_logs": bpm_logs,
+        "skipped_ambiguous": skipped_ambiguous,
         "songlist": obj,
     }
 
@@ -695,6 +845,8 @@ def assign_pack(song_ids: list[str], pack_name: str, chapter_code: str | None = 
         mapping = load_pack_map()
         mapping[chapter_code] = pack_name
         save_pack_map(mapping)
+
+    remap_song_map_ids(results)
 
     obj["data"] = [sanitize_song(song) for song in data]
     obj["lastUpdate"] = date.today().isoformat()
